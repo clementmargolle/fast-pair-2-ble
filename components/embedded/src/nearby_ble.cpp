@@ -1,5 +1,11 @@
 #include "embedded.hpp"
 
+#include "nearby_fhn.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/timers.h"
+#include "freertos/queue.h"
+
 static espp::Logger logger({.tag = "GFPS BLE", .level = espp::Logger::Verbosity::DEBUG});
 
 static const nearby_platform_BleInterface *g_ble_interface = nullptr;
@@ -33,6 +39,10 @@ enum
     IDX_CHAR_FW_REVISION,
     IDX_CHAR_VAL_FW_REVISION,
 
+    IDX_CHAR_BEACON_ACTIONS,
+    IDX_CHAR_VAL_BEACON_ACTIONS,
+    IDX_CHAR_CFG_BEACON_ACTIONS,
+
     GFPS_IDX_NB,
   };
 
@@ -49,6 +59,13 @@ static uint8_t ENCRYPTED_PASSKEY_BLOCK[16] = {0};
 
 static std::vector<uint8_t> raw_adv_data;
 static std::vector<uint8_t> remote_bd_addr;
+
+// FHN advertising state
+static std::vector<uint8_t> fast_pair_adv_data;  // Store Fast Pair advertisement
+static std::vector<uint8_t> fhn_adv_data;        // Store FHN advertisement
+static bool use_fhn_advertisement = false;       // Toggle between Fast Pair and FHN
+static TimerHandle_t fhn_adv_timer = nullptr;    // Timer to switch between advertisements
+static QueueHandle_t fhn_adv_queue = nullptr;     // Queue to notify main task about advertisement switch
 
 /* Service */
 // NOTE: these UUIDs are specified at 16-bit, which means that 1) they are not
@@ -75,6 +92,10 @@ static const uint8_t GATTS_CHAR_UUID_GFPS_ACCOUNT_KEY[16]   = {0xEA, 0x0B, 0x10,
                                                                0xDE, 0x01, 0xB0, 0x8E,
                                                                0x14, 0x48, 0x66, 0x83,
                                                                0x36, 0x12, 0x2C, 0xFE};
+static const uint8_t GATTS_CHAR_UUID_GFPS_BEACON_ACTIONS[16] = {0xEA, 0x0B, 0x10, 0x32,
+                                                               0xDE, 0x01, 0xB0, 0x8E,
+                                                               0x14, 0x48, 0x66, 0x83,
+                                                               0x38, 0x12, 0x2C, 0xFE};
 
 
 /* The max length of characteristic value. When the GATT client performs a write or prepare write operation,
@@ -88,6 +109,8 @@ static const uint8_t GATTS_CHAR_UUID_GFPS_ACCOUNT_KEY[16]   = {0xEA, 0x0B, 0x10,
 #define SCAN_RSP_CONFIG_FLAG        (1 << 1)
 
 static uint8_t adv_config_done       = 0;
+static bool gatt_service_started    = false;
+static bool advertising_configured   = false;
 
 static uint16_t gfps_handle_table[GFPS_IDX_NB];
 
@@ -177,6 +200,7 @@ static const uint16_t character_client_config_uuid = ESP_GATT_UUID_CHAR_CLIENT_C
 static const uint8_t char_prop_read                = ESP_GATT_CHAR_PROP_BIT_READ;
 static const uint8_t char_prop_write               = ESP_GATT_CHAR_PROP_BIT_WRITE;
 static const uint8_t char_prop_read_write_notify   = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+static const uint8_t char_prop_read_write_notify_fhn = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
 
 // TODO: update
 static const uint8_t ccc[2]           = {0x01, 0x00}; // LSb corresponds to notifications (1 if enabled, 0 if disabled), next bit (bit 1) corresponds to indications - 1 if enabled, 0 if disabled
@@ -250,6 +274,21 @@ static const esp_gatts_attr_db_t gatt_db[GFPS_IDX_NB] =
     [IDX_CHAR_VAL_FW_REVISION]  =
     {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_GFPS_FW_REVISION, ESP_GATT_PERM_READ,
                            GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(fw_revision), (uint8_t *)fw_revision}},
+
+    /* Characteristic Declaration */
+    [IDX_CHAR_BEACON_ACTIONS]      =
+    {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ,
+                           CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE, (uint8_t *)&char_prop_read_write_notify_fhn}},
+
+    /* Characteristic Value */
+    [IDX_CHAR_VAL_BEACON_ACTIONS]  =
+    {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_128, (uint8_t *)GATTS_CHAR_UUID_GFPS_BEACON_ACTIONS, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                           GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
+
+    /* Client Characteristic Configuration Descriptor */
+    [IDX_CHAR_CFG_BEACON_ACTIONS]  =
+    {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&character_client_config_uuid, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                           sizeof(uint16_t), sizeof(ccc), (uint8_t *)ccc}},
 
 
   };
@@ -325,6 +364,128 @@ const char *ble_gatts_evt_str(uint8_t event) {
         return "UNKNOWN";
     }
     return ble_gatts_evt_names[event];
+}
+
+// Generate FHN ephemeral identifier for testing (20 bytes)
+// In production, this should be derived from EIK and rotated periodically
+static void GenerateFhnEphemeralIdentifier(uint8_t* eid, size_t eid_size) {
+  // For testing: use fixed values
+  // In real implementation, this would be: SHA256(EIK || rotation_counter)[0:20]
+  if (eid_size >= 20) {
+    // Use test values: 0x01, 0x02, 0x03, etc.
+    eid[0] = 0x01;
+    eid[1] = 0x02;
+    eid[2] = 0x03;
+    eid[3] = 0x04;
+    eid[4] = 0x05;
+    eid[5] = 0x06;
+    eid[6] = 0x07;
+    eid[7] = 0x08;
+    eid[8] = 0x09;
+    eid[9] = 0x0A;
+    eid[10] = 0x0B;
+    eid[11] = 0x0C;
+    eid[12] = 0x0D;
+    eid[13] = 0x0E;
+    eid[14] = 0x0F;
+    eid[15] = 0x10;
+    eid[16] = 0x11;
+    eid[17] = 0x12;
+    eid[18] = 0x13;
+    eid[19] = 0x14;
+  }
+}
+
+// Create FHN advertisement data
+// According to FHN spec, advertisement contains ephemeral identifier (20 bytes)
+static std::vector<uint8_t> CreateFhnAdvertisement() {
+  std::vector<uint8_t> fhn_adv; 
+  
+  // AD Type 0x01: Flags
+  fhn_adv.push_back(0x02); // Length: 2 bytes
+  fhn_adv.push_back(0x01); // AD Type: Flags
+  fhn_adv.push_back(0x06); // BR/EDR Not Supported (non-discoverable for FHN)
+  
+  // AD Type 0x16: Service Data with FHN ephemeral identifier
+  // Format: [Length][Type 0x16][UUID 0xAA 0xFE][Ephemeral ID 20 bytes]
+  uint8_t ephemeral_id[20];
+  GenerateFhnEphemeralIdentifier(ephemeral_id, sizeof(ephemeral_id));
+  
+  // Service Data length: 1 (type) + 2 (UUID) + 20 (EID) = 23 bytes
+  fhn_adv.push_back(0x18); // Length (24 bytes, but we use 23)
+  fhn_adv.push_back(0x16); // AD Type: Service Data
+  fhn_adv.push_back(0xAA); // UUID low byte (0xFEAA)
+  fhn_adv.push_back(0xFE); // UUID high byte
+  fhn_adv.push_back(0x40); // unwanted tracking
+  // Add ephemeral identifier
+  for (int i = 0; i < 20 ; i++) {
+    fhn_adv.push_back(ephemeral_id[i]);
+  }
+  
+  logger.info("Created FHN advertisement: {} bytes, EID: {::#x}", 
+                fhn_adv.size(), std::vector<uint8_t>(ephemeral_id, ephemeral_id + 20));
+  
+  return fhn_adv;
+}
+
+// Timer callback to send FHN advertisement
+// This runs in timer task context, so we use a queue to notify the main task
+static void FhnAdvertisementTimerCallback(TimerHandle_t xTimer) {
+  // Send notification to send FHN advertisement
+  bool send_fhn = true;
+  if (fhn_adv_queue != nullptr) {
+    xQueueSend(fhn_adv_queue, &send_fhn, 0);
+  }
+}
+
+// Task to handle FHN advertisement insertion
+// Sends FHN advertisement every 1 second, then immediately returns to Fast Pair
+static void FhnAdvertisementSwitchTask(void* pvParameters) {
+  bool send_fhn;
+  
+  while (1) {
+    // Wait for notification from timer (every 1 second)
+    if (xQueueReceive(fhn_adv_queue, &send_fhn, portMAX_DELAY) == pdTRUE) {
+      if (fhn_adv_data.size() > 0 && fast_pair_adv_data.size() > 0) {
+        logger.info("Sending FHN advertisement ({} bytes)", fhn_adv_data.size());
+        
+        // Temporarily switch to FHN advertisement
+        esp_ble_gap_stop_advertising();
+        
+        // Small delay to ensure stop completes
+        vTaskDelay(pdMS_TO_TICKS(50));
+        
+        // Update advertising data to FHN
+        esp_ble_gap_config_adv_data_raw(fhn_adv_data.data(), fhn_adv_data.size());
+        adv_config_done |= ADV_CONFIG_FLAG;
+        
+        // Restart advertising with FHN data
+        esp_err_t err = esp_ble_gap_start_advertising(&adv_params);
+        if (err != ESP_OK) {
+          logger.error("Failed to start FHN advertising: {:#x}", err);
+        } else {
+          // Wait a short time to send a few FHN advertisements
+          vTaskDelay(pdMS_TO_TICKS(100));
+          
+          // Switch back to Fast Pair advertisement
+          logger.info("Returning to Fast Pair advertisement ({} bytes)", fast_pair_adv_data.size());
+          esp_ble_gap_stop_advertising();
+          vTaskDelay(pdMS_TO_TICKS(50));
+          
+          // Restore Fast Pair advertisement
+          esp_ble_gap_config_adv_data_raw(fast_pair_adv_data.data(), fast_pair_adv_data.size());
+          adv_config_done |= ADV_CONFIG_FLAG;
+          
+          err = esp_ble_gap_start_advertising(&adv_params);
+          if (err != ESP_OK) {
+            logger.error("Failed to restart Fast Pair advertising: {:#x}", err);
+          }
+        }
+      } else {
+        logger.warn("FHN or Fast Pair advertisement data not available");
+      }
+    }
+  }
 }
 
 const char *esp_ble_key_type_str(esp_ble_key_type_t key_type) {
@@ -425,34 +586,76 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
      * */
   case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
     adv_config_done &= (~ADV_CONFIG_FLAG);
-    if (adv_config_done == 0){
-      esp_ble_gap_start_advertising(&adv_params);
+    advertising_configured = true;
+    if (adv_config_done == 0 && gatt_service_started){
+      logger.info("Starting advertising after ADV_DATA_RAW_SET_COMPLETE");
+      esp_err_t err = esp_ble_gap_start_advertising(&adv_params);
+      if (err != ESP_OK) {
+        logger.error("esp_ble_gap_start_advertising() FAILED with error: {:#x}", err);
+      } else {
+        logger.info("esp_ble_gap_start_advertising() called successfully, waiting for ADV_START_COMPLETE event");
+      }
+    } else {
+      logger.debug("Cannot start advertising yet: adv_config_done=0x{:02X}, gatt_service_started={}", 
+                   adv_config_done, gatt_service_started);
     }
     break;
   case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
     adv_config_done &= (~ADV_CONFIG_FLAG);
-    if (adv_config_done == 0){
-      esp_ble_gap_start_advertising(&adv_params);
+    advertising_configured = true;
+    if (adv_config_done == 0 && gatt_service_started){
+      logger.info("Starting advertising after ADV_DATA_SET_COMPLETE");
+      esp_err_t err = esp_ble_gap_start_advertising(&adv_params);
+      if (err != ESP_OK) {
+        logger.error("esp_ble_gap_start_advertising() FAILED with error: {:#x}", err);
+      } else {
+        logger.info("esp_ble_gap_start_advertising() called successfully, waiting for ADV_START_COMPLETE event");
+      }
+    } else {
+      logger.debug("Cannot start advertising yet: adv_config_done=0x{:02X}, gatt_service_started={}", 
+                   adv_config_done, gatt_service_started);
     }
     break;
   case ESP_GAP_BLE_SCAN_RSP_DATA_RAW_SET_COMPLETE_EVT:
     adv_config_done &= (~SCAN_RSP_CONFIG_FLAG);
-    if (adv_config_done == 0){
-      esp_ble_gap_start_advertising(&adv_params);
+    if (adv_config_done == 0 && gatt_service_started){
+      logger.info("Starting advertising after SCAN_RSP_DATA_RAW_SET_COMPLETE");
+      esp_err_t err = esp_ble_gap_start_advertising(&adv_params);
+      if (err != ESP_OK) {
+        logger.error("esp_ble_gap_start_advertising() FAILED with error: {:#x}", err);
+      } else {
+        logger.info("esp_ble_gap_start_advertising() called successfully, waiting for ADV_START_COMPLETE event");
+      }
+    } else {
+      logger.debug("Cannot start advertising yet: adv_config_done=0x{:02X}, gatt_service_started={}", 
+                   adv_config_done, gatt_service_started);
     }
     break;
   case ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT:
     adv_config_done &= (~SCAN_RSP_CONFIG_FLAG);
-    if (adv_config_done == 0){
-      esp_ble_gap_start_advertising(&adv_params);
+    if (adv_config_done == 0 && gatt_service_started){
+      logger.info("Starting advertising after SCAN_RSP_DATA_SET_COMPLETE");
+      esp_err_t err = esp_ble_gap_start_advertising(&adv_params);
+      if (err != ESP_OK) {
+        logger.error("esp_ble_gap_start_advertising() FAILED with error: {:#x}", err);
+      } else {
+        logger.info("esp_ble_gap_start_advertising() called successfully, waiting for ADV_START_COMPLETE event");
+      }
+    } else {
+      logger.debug("Cannot start advertising yet: adv_config_done=0x{:02X}, gatt_service_started={}", 
+                   adv_config_done, gatt_service_started);
     }
     break;
   case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
     /* advertising start complete event to indicate advertising start successfully or failed */
     if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
-      logger.error("advertising start failed");
+      logger.error("advertising start failed with status: {:#x}", param->adv_start_cmpl.status);
     }else{
       logger.info("advertising start successfully");
+      // Log current advertising parameters for verification
+      logger.info("Advertising parameters: min_int={}, max_int={}, type={}, addr_type={}, channel_map={:#x}, filter_policy={}",
+                  adv_params.adv_int_min, adv_params.adv_int_max, adv_params.adv_type,
+                  adv_params.own_addr_type, adv_params.channel_map, adv_params.adv_filter_policy);
     }
     break;
   case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
@@ -653,7 +856,29 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
         characteristic = kAccountKey;
       } else if (param->read.handle ==gfps_handle_table[IDX_CHAR_VAL_FW_REVISION]) {
         logger.debug("read firmware revision");
+        // According to FHN spec, firmware revision requires authentication
+        // Check if device is paired or FHN authenticated operation was performed
+        if (!nearby_fhn_IsAuthenticated()) {
+          logger.warn("Firmware revision read denied: not authenticated");
+          esp_ble_gatts_send_response(gatts_if, param->read.conn_id, param->read.trans_id,
+                                      ESP_GATT_INSUF_AUTHORIZATION, NULL);
+          break;
+        }
         characteristic = kFirmwareRevision;
+      } else if (param->read.handle ==gfps_handle_table[IDX_CHAR_VAL_BEACON_ACTIONS]) {
+        logger.debug("read beacon actions (FHN)");
+        characteristic = kBeaconActions;
+        // Handle FHN read directly (generates nonce)
+        size_t output_size = 32;
+        uint8_t *output = (uint8_t *)malloc(sizeof(uint8_t) * output_size);
+        nearby_platform_status status = nearby_fhn_HandleRead(output, &output_size);
+        if (status == kNearbyStatusOK) {
+          esp_ble_gatts_set_attr_value(param->read.handle, output_size, output);
+        } else {
+          logger.error("FHN read failed: {}", (int)status);
+        }
+        free(output);
+        break;
       } else {
         logger.error("Unknown characteristic handle: {}", param->read.handle);
         break;
@@ -684,13 +909,16 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
     if (!param->write.is_prep){
       bool is_cfg_handle =
         gfps_handle_table[IDX_CHAR_CFG_KB_PAIRING] == param->write.handle ||
-        gfps_handle_table[IDX_CHAR_CFG_PASSKEY] == param->write.handle;
+        gfps_handle_table[IDX_CHAR_CFG_PASSKEY] == param->write.handle ||
+        gfps_handle_table[IDX_CHAR_CFG_BEACON_ACTIONS] == param->write.handle;
 
       if (is_cfg_handle && param->write.len == 2){
         logger.debug("Configuration of {}",
                      param->write.handle == gfps_handle_table[IDX_CHAR_CFG_KB_PAIRING]
                      ? "IDX_CHAR_CFG_KB_PAIRING"
-                     : "IDX_CHAR_CFG_PASSKEY");
+                     : param->write.handle == gfps_handle_table[IDX_CHAR_CFG_PASSKEY]
+                     ? "IDX_CHAR_CFG_PASSKEY"
+                     : "IDX_CHAR_CFG_BEACON_ACTIONS");
         uint16_t descr_value = param->write.value[1]<<8 | param->write.value[0];
         if (descr_value == 0x0001) {
           logger.info("notify enable");
@@ -701,6 +929,27 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
         } else {
           logger.error("unknown descr value");
         }
+      } else if (param->write.handle == gfps_handle_table[IDX_CHAR_VAL_BEACON_ACTIONS]) {
+        logger.debug("write to IDX_CHAR_VAL_BEACON_ACTIONS (FHN)");
+        // Handle FHN write directly
+        size_t output_size = 32;
+        uint8_t *output = (uint8_t *)malloc(sizeof(uint8_t) * output_size);
+        nearby_platform_status status = nearby_fhn_HandleWrite(
+            param->write.value, param->write.len, output, &output_size);
+        if (status == kNearbyStatusOK && output_size > 0) {
+          // Send response back
+          esp_ble_gatts_set_attr_value(param->write.handle, output_size, output);
+          // Send notification if needed
+          esp_ble_gatts_send_indicate(gfps_profile_tab[PROFILE_APP_IDX].gatts_if,
+                                     gfps_profile_tab[PROFILE_APP_IDX].conn_id,
+                                     param->write.handle,
+                                     output_size,
+                                     output,
+                                     false);
+        } else {
+          logger.error("FHN write failed: {}", (int)status);
+        }
+        free(output);
       } else {
         // use the g_ble_interface on_gatt_write callback to handle this
         if (g_ble_interface != nullptr){
@@ -763,6 +1012,22 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
     break;
   case ESP_GATTS_START_EVT:
     logger.info("SERVICE_START_EVT, status {}, service_handle {}", (int)param->start.status, (int)param->start.service_handle);
+    if (param->start.status == ESP_GATT_OK) {
+      gatt_service_started = true;
+      // Start advertising if it was already configured
+      if (advertising_configured && adv_config_done == 0) {
+        logger.info("GATT service started successfully, starting advertising now");
+        esp_err_t err = esp_ble_gap_start_advertising(&adv_params);
+        if (err != ESP_OK) {
+          logger.error("esp_ble_gap_start_advertising() FAILED with error: {:#x}", err);
+        } else {
+          logger.info("esp_ble_gap_start_advertising() called successfully, waiting for ADV_START_COMPLETE event");
+        }
+      } else {
+        logger.debug("Advertising not ready yet: advertising_configured={}, adv_config_done=0x{:02X}",
+                     advertising_configured, adv_config_done);
+      }
+    }
     break;
   case ESP_GATTS_CONNECT_EVT: {
     logger.info("ESP_GATTS_CONNECT_EVT, conn_id = {}", (int)param->connect.conn_id);
@@ -966,23 +1231,156 @@ nearby_platform_status nearby_platform_GattNotify(
 nearby_platform_status nearby_platform_SetAdvertisement(
     const uint8_t* payload, size_t length,
     nearby_fp_AvertisementInterval interval) {
-  logger.info("Setting advertisement, interval code: {}", (int)interval);
-  // set the advertisement data
-  raw_adv_data.assign(payload, payload + length);
+  logger.info("Setting advertisement, interval code: {}, length: {}", (int)interval, length);
+  advertising_configured = false; // Reset flag, will be set when config completes
 
-  // For information of the contents of the payload, see:
-  // https://btprodspecificationrefs.blob.core.windows.net/assigned-numbers/Assigned%20Number%20Types/Assigned_Numbers.pdf
-  // The payload is a length byte, followed by the data type and data bytes, in
-  // sequence
+  // According to Fast Pair specification:
+  // https://developers.google.com/nearby/fast-pair/specifications/service/provider
+  // 
+  // Mode détectable (pairing):
+  //   - Service Data (AD Type 0x16): UUID 0xFE2C + Model ID (3 bytes)
+  //   - Flags: LE General Discoverable (0x02) | BR/EDR Not Supported (0x04) = 0x06
+  //   - Interval: max 100ms
+  //
+  // Mode non-détectable:
+  //   - Service Data (AD Type 0x16): UUID 0xFE2C + Version + Account Key Filter + Salt
+  //   - Flags: BR/EDR Not Supported (0x04) seulement (pas General Discoverable)
+  //   - Interval: max 250ms
+  //
+  // For Android compatibility, we also need:
+  // - AD Type 0x03: Complete List of 16-bit Service UUIDs (0xFE2C)
+  //
+  // BLE advertising data has a maximum size of 31 bytes.
+  
+  std::vector<uint8_t> complete_adv_data;
+  
+  // Check if device is in pairing mode (discoverable)
+  bool is_pairing_mode = nearby_platform_IsInPairingMode();
+   
+  // AD Type 0x01: Flags
+  // According to spec: General Discoverable only when in pairing mode
+  complete_adv_data.push_back(0x02); // Length: 2 bytes (1 byte type + 1 byte data)
+  complete_adv_data.push_back(0x01); // AD Type: Flags
+  if (is_pairing_mode) {
+    // Mode détectable: LE General Discoverable (0x02) | BR/EDR Not Supported (0x04) = 0x06
+    complete_adv_data.push_back(0x06);
+  } else {
+    // Mode non-détectable: BR/EDR Not Supported (0x04) seulement
+    complete_adv_data.push_back(0x04);
+  }
+  
+  // AD Type 0x03: Complete List of 16-bit Service UUIDs (Fast Pair Service UUID 0xFE2C)
+  // This is REQUIRED for Android Fast Pair validator
+  complete_adv_data.push_back(0x03); // Length: 3 bytes (1 byte type + 2 bytes UUID)
+  complete_adv_data.push_back(0x03); // AD Type: Complete List of 16-bit Service UUIDs
+  complete_adv_data.push_back(0x2C); // UUID low byte (little-endian: 0xFE2C -> 0x2C 0xFE)
+  complete_adv_data.push_back(0xFE); // UUID high byte (little-endian)
+  
+  // Add the service data from Nearby (AD Type 0x16 with UUID 0xFE2C)
+  // The payload from Nearby is already correctly formatted:
+  // - Mode détectable: [Length][Type 0x16][UUID 0x2C 0xFE][ModelID 3 bytes]
+  // - Mode non-détectable: [Length][Type 0x16][UUID 0x2C 0xFE][Version][AccountKeyFilter][Salt]
+  // We use it as-is since Nearby handles the format according to the mode
+  if (length > 0) {
+    complete_adv_data.insert(complete_adv_data.end(), payload, payload + length);
+    logger.debug("Added Service Data from Nearby: {} bytes (pairing mode: {})", length, is_pairing_mode);
+  }
+  
+  // FHN: Add anti-tracking mode indication if enabled
+  // According to FHN spec, anti-tracking mode should be indicated in advertising
+  // When anti-tracking is enabled, MAC address should be randomized (configured in ESP-IDF)
+  if (nearby_fhn_IsAntiTrackingMode()) {
+    logger.info("FHN: Anti-tracking mode is active - advertising with anti-tracking indication");
+    // The anti-tracking indication is primarily handled via MAC address randomization
+    // which should be configured via esp_ble_gap_set_rand_addr() when anti-tracking is enabled
+    // You can also modify the advertising data here if needed for your specific implementation
+  }
+  
+  // Verify total size doesn't exceed 31 bytes (BLE standard limit)
+  if (complete_adv_data.size() > 31) {
+    logger.error("Advertising data too large: {} bytes (max 31)", complete_adv_data.size());
+    // Fallback: use only payload from Nearby (may not work on Android but should work on iOS)
+    raw_adv_data.assign(payload, payload + length);
+  } else {
+    raw_adv_data = complete_adv_data;
+  }
+  
+  // Store Fast Pair advertisement data for alternation with FHN
+  fast_pair_adv_data = raw_adv_data;
+  
+  // Generate FHN advertisement if not already created
+  if (fhn_adv_data.size() == 0) {
+    fhn_adv_data = CreateFhnAdvertisement();
+  }
+  
+  // Log detailed advertising data breakdown for debugging
+  logger.info("=== Advertising Data Analysis ===");
+  logger.info("Total advertising data length: {} bytes, Nearby payload length: {} bytes", raw_adv_data.size(), length);
+  logger.info("Advertising data breakdown:");
+  logger.info("  - Flags (AD Type 0x01): 2 bytes (0x{:02X} 0x{:02X})", 
+              raw_adv_data.size() > 0 ? raw_adv_data[0] : 0,
+              raw_adv_data.size() > 1 ? raw_adv_data[1] : 0);
+  
+  // Find and log Service UUIDs (AD Type 0x03)
+  size_t offset = 0;
+  while (offset < raw_adv_data.size()) {
+    if (offset + 1 >= raw_adv_data.size()) break;
+    uint8_t ad_length = raw_adv_data[offset];
+    if (ad_length == 0 || offset + ad_length >= raw_adv_data.size()) break;
+    uint8_t ad_type = raw_adv_data[offset + 1];
+    
+    if (ad_type == 0x03 && ad_length >= 3) {
+      // Complete List of 16-bit Service UUIDs
+      uint16_t uuid = raw_adv_data[offset + 2] | (raw_adv_data[offset + 3] << 8);
+      logger.info("  - Service UUIDs (AD Type 0x03): {} bytes, UUID=0x{:04X} {}", 
+                  ad_length + 1, uuid, uuid == 0xFE2C ? "✓ CORRECT" : "✗ WRONG!");
+    } else if (ad_type == 0x16 && ad_length >= 3) {
+      // Service Data
+      uint16_t service_uuid = raw_adv_data[offset + 2] | (raw_adv_data[offset + 3] << 8);
+      logger.info("  - Service Data (AD Type 0x16): {} bytes, Service UUID=0x{:04X} {}", 
+                  ad_length + 1, service_uuid, service_uuid == 0xFE2C ? "✓ CORRECT" : "✗ WRONG!");
+      
+      // Extract Model ID from service data (last 3 bytes)
+      if (ad_length >= 6) {
+        uint32_t model_id_bytes = (raw_adv_data[offset + 4] << 16) | 
+                                   (raw_adv_data[offset + 5] << 8) | 
+                                   raw_adv_data[offset + 6];
+        logger.info("    Model ID bytes: 0x{:02X} 0x{:02X} 0x{:02X} = 0x{:06X}",
+                    raw_adv_data[offset + 4], raw_adv_data[offset + 5], raw_adv_data[offset + 6],
+                    model_id_bytes & 0xFFFFFF);
+        logger.info("    Expected Model ID: 0x{:06X} {}", 
+                    MODEL_ID & 0xFFFFFF,
+                    (model_id_bytes & 0xFFFFFF) == (MODEL_ID & 0xFFFFFF) ? "✓ MATCH" : "✗ MISMATCH");
+      }
+    }
+    
+    offset += ad_length + 1;
+  }
+  
+  logger.info("Complete advertising data (hex): {::#x}", raw_adv_data);
+  logger.info("Nearby payload (hex): {::#x}", std::vector<uint8_t>(payload, payload + length));
+  
+  // Verify total size
+  if (raw_adv_data.size() > 31) {
+    logger.error("⚠️  Advertising data exceeds 31 bytes limit!");
+  } else {
+    logger.info("✓ Advertising data size is within 31 bytes limit");
+  }
 
-  // set the advertising interval
+  // set the advertising interval according to Fast Pair spec:
+  // - Mode détectable (pairing): max 100ms (10 Hz) -> use kNoLargerThan100ms
+  // - Mode non-détectable: max 250ms (4 Hz) -> use kNoLargerThan250ms
   uint8_t new_interval = 0x20; // Units of 1.25ms, so 0x20 = 40ms
   switch (interval) {
   case kNoLargerThan100ms:
-    new_interval = 0x20; // 0x20 = 40ms (units of 1.25ms)
+    // Mode détectable: max 100ms, use 40ms (0x20) for faster discovery
+    new_interval = 0x20; // 0x20 = 40ms (units of 1.25ms) = 10 Hz
+    logger.debug("Advertising interval: 40ms (discoverable mode)");
     break;
   case kNoLargerThan250ms:
-    new_interval = 0x40; // 0x40 = 80ms (units of 1.25ms)
+    // Mode non-détectable: max 250ms, use 200ms (0xC8) for 4 Hz
+    new_interval = 0xC8; // 0xC8 = 200ms (units of 1.25ms) = 5 Hz (within 4 Hz spec)
+    logger.debug("Advertising interval: 200ms (non-discoverable mode)");
     break;
   default:
     logger.error("Unsupported advertising interval: {}", (int)interval);
@@ -991,11 +1389,48 @@ nearby_platform_status nearby_platform_SetAdvertisement(
   adv_params.adv_int_min = new_interval;
   adv_params.adv_int_max = new_interval;
 
+  // Start with Fast Pair advertisement (normal operation)
+  use_fhn_advertisement = false;
   esp_ble_gap_config_adv_data_raw(raw_adv_data.data(), raw_adv_data.size());
   // esp_ble_gap_config_adv_data(&adv_config); // NOTE: for some reason this isn't working...
   esp_ble_gap_config_adv_data(&scan_rsp_config);
   adv_config_done |= ADV_CONFIG_FLAG;
   adv_config_done |= SCAN_RSP_CONFIG_FLAG;
+  
+  // Create queue and task for FHN advertisement insertion
+  // FHN advertisements will be sent every 1 second, then return to Fast Pair
+  if (fhn_adv_queue == nullptr) {
+    fhn_adv_queue = xQueueCreate(5, sizeof(bool));
+    if (fhn_adv_queue == nullptr) {
+      logger.error("Failed to create FHN advertisement queue");
+    } else {
+      // Create task to handle FHN advertisement insertion
+      xTaskCreate(
+        FhnAdvertisementSwitchTask,
+        "FHN_Adv_Switch",
+        4096,  // Stack size
+        nullptr,
+        5,     // Priority
+        nullptr
+      );
+      
+      // Create timer to send FHN advertisement every 1 second
+      fhn_adv_timer = xTimerCreate(
+        "FHN_Adv_Timer",           // Timer name
+        pdMS_TO_TICKS(1000),        // Period: 1000ms = 1 second
+        pdTRUE,                     // Auto-reload (periodic)
+        (void*)0,                   // Timer ID
+        FhnAdvertisementTimerCallback // Callback function
+      );
+      
+      if (fhn_adv_timer != nullptr) {
+        xTimerStart(fhn_adv_timer, 0);
+        logger.info("Started FHN advertisement timer: sends FHN every 1 second, keeps Fast Pair otherwise");
+      } else {
+        logger.error("Failed to create FHN advertisement timer");
+      }
+    }
+  }
 
   return kNearbyStatusOK;
 }
@@ -1041,6 +1476,9 @@ nearby_platform_status nearby_platform_BleInit(
   esp_ble_gatts_app_register(ESP_APP_ID);
 
   // esp_ble_gatt_set_local_mtu(500);
+
+  // Initialize FHN module
+  nearby_fhn_Init();
 
   return kNearbyStatusOK;
 }
